@@ -131,7 +131,9 @@ def main() -> None:
 
   if torch.cuda.is_available():
     device = torch.device("cuda")
-    per_device_batch_size = args.batch_size // torch.cuda.device_count()
+    per_device_batch_size = max(
+        1, args.batch_size // max(1, torch.cuda.device_count())
+    )
   else:
     device = torch.device("cpu")
     per_device_batch_size = args.batch_size
@@ -158,9 +160,15 @@ def main() -> None:
       per_device_eval_batch_size=per_device_batch_size,
       dataloader_pin_memory=False,
   )
+  data_collator = transformers.DataCollatorWithPadding(
+      tokenizer=tokenizer,
+      padding="longest",
+      return_tensors="pt",
+  )
   trainer = transformers.Trainer(
       model=model,
       args=training_args,
+      data_collator=data_collator,
   )
   predictions, _, _ = trainer.predict(test_dataset=ds["test"])
 
