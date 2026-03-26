@@ -161,6 +161,7 @@ def main() -> None:
   trainer = transformers.Trainer(
       model=model,
       args=training_args,
+      data_collator=transformers.DataCollatorWithPadding(tokenizer),
   )
   predictions, _, _ = trainer.predict(test_dataset=ds["test"])
 
