@@ -8,7 +8,7 @@ MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--metricx
 TOKENIZER_SNAPSHOT="${TOKENIZER_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--mt5-xl/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-/llm-align/liuchonghan/metricx_result}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_INPUT_LENGTH="${MAX_INPUT_LENGTH:-1024}"
 NUM_GPUS="${NUM_GPUS:-8}"
 PREPROCESSING_NUM_WORKERS="${PREPROCESSING_NUM_WORKERS:-8}"
