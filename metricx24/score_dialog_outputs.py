@@ -145,10 +145,10 @@ def _dialog_to_example(
   if user_turn is None or assistant_turn is None:
     raise ValueError("Each line must contain at least one user turn and one assistant turn.")
 
-  source = _extract_source(
-      str(user_turn.get("content", "")), prompt_prefixes
-  )
-  hypothesis = str(assistant_turn.get("content", "")).strip()
+  original_source = str(user_turn.get("content", ""))
+  original_hypothesis = str(assistant_turn.get("content", "")).strip()
+  source = _extract_source(original_source, prompt_prefixes)
+  hypothesis = original_hypothesis
 
   if not source:
     raise ValueError("Parsed source text is empty.")
@@ -159,6 +159,7 @@ def _dialog_to_example(
       "source": source,
       "hypothesis": hypothesis,
       "reference": "",
+      "original_source": original_source,
   }
 
 
@@ -503,7 +504,11 @@ def main() -> None:
 
     detail_rows = []
     for example, score in zip(examples, scores):
-      record = dict(example)
+      record = {
+          "source": example["original_source"],
+          "hypothesis": example["hypothesis"],
+          "reference": example["reference"],
+      }
       record["prediction"] = float(score)
       detail_rows.append(record)
     _write_jsonl(detail_path, detail_rows)
