@@ -164,9 +164,10 @@ def _dialog_to_example(
 
 def _load_examples(
     input_file: str, prompt_prefixes: list[str]
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
   """Loads and converts a chat-style result file."""
   examples = []
+  bad_rows = []
   with open(input_file, "r", encoding="utf-8") as f:
     for line_num, line in enumerate(f, start=1):
       line = line.strip()
@@ -181,8 +182,13 @@ def _load_examples(
       try:
         examples.append(_dialog_to_example(dialog, prompt_prefixes))
       except ValueError as exc:
-        raise ValueError(f"{input_file}:{line_num} parse failed: {exc}") from exc
-  return examples
+        bad_rows.append({
+            "input_file": input_file,
+            "line_num": line_num,
+            "error": str(exc),
+            "raw_line": line,
+        })
+  return examples, bad_rows
 
 
 def _build_dataset(
@@ -255,6 +261,15 @@ def _detail_filename(input_file: str) -> str:
   return f"{parent}__{os.path.basename(input_file)}.jsonl"
 
 
+def _bad_rows_filename(input_file: str) -> str:
+  parent = os.path.basename(os.path.dirname(input_file))
+  return f"{parent}__{os.path.basename(input_file)}.bad_rows.jsonl"
+
+
+def _tmp_path(output_file: str) -> str:
+  return output_file + ".tmp"
+
+
 def _shard_input_files(
     input_files: list[str], shard_index: int, num_shards: int
 ) -> list[str]:
@@ -287,8 +302,25 @@ def _write_json(output_file: str, payload: Any) -> None:
   dirname = os.path.dirname(output_file)
   if dirname:
     os.makedirs(dirname, exist_ok=True)
-  with open(output_file, "w", encoding="utf-8") as out:
+  tmp_output_file = _tmp_path(output_file)
+  with open(tmp_output_file, "w", encoding="utf-8") as out:
     json.dump(payload, out, ensure_ascii=False, indent=2)
+  os.replace(tmp_output_file, output_file)
+
+
+def _write_jsonl(output_file: str, rows: list[dict[str, Any]]) -> None:
+  dirname = os.path.dirname(output_file)
+  if dirname:
+    os.makedirs(dirname, exist_ok=True)
+  tmp_output_file = _tmp_path(output_file)
+  with open(tmp_output_file, "w", encoding="utf-8") as out:
+    for row in rows:
+      out.write(json.dumps(row, ensure_ascii=False) + "\n")
+  os.replace(tmp_output_file, output_file)
+
+
+def _is_completed_output(output_file: str) -> bool:
+  return os.path.exists(output_file) and not os.path.exists(_tmp_path(output_file))
 
 
 def _summarize_by_dir(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -314,6 +346,34 @@ def _summarize_by_dir(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
     del item["weighted_score_sum"]
     summary_by_dir_items.append(item)
   return sorted(summary_by_dir_items, key=lambda item: item["input_dir"])
+
+
+def _summary_item_from_detail_file(
+    input_file: str, detail_file: str
+) -> dict[str, Any]:
+  scores = []
+  with open(detail_file, "r", encoding="utf-8") as f:
+    for line in f:
+      line = line.strip()
+      if not line:
+        continue
+      record = json.loads(line)
+      scores.append(float(record["prediction"]))
+
+  if not scores:
+    raise ValueError(f"Completed detail file {detail_file} is empty.")
+
+  score_array = np.asarray(scores, dtype=float)
+  return {
+      "input_file": input_file,
+      "input_dir": os.path.dirname(input_file),
+      "num_examples": len(score_array),
+      "mean_score": float(np.mean(score_array)),
+      "median_score": float(np.median(score_array)),
+      "min_score": float(np.min(score_array)),
+      "max_score": float(np.max(score_array)),
+      "detail_file": detail_file,
+  }
 
 
 def _write_final_summaries(output_dir: str, summary: list[dict[str, Any]]) -> None:
@@ -352,6 +412,8 @@ def main() -> None:
   os.makedirs(args.output_dir, exist_ok=True)
   details_dir = os.path.join(args.output_dir, "details")
   os.makedirs(details_dir, exist_ok=True)
+  bad_rows_dir = os.path.join(args.output_dir, "bad_rows")
+  os.makedirs(bad_rows_dir, exist_ok=True)
 
   if args.num_shards < 1:
     raise ValueError("--num_shards must be at least 1.")
@@ -412,7 +474,23 @@ def main() -> None:
   )
 
   for input_file in input_files:
-    examples = _load_examples(input_file, args.prompt_prefixes)
+    detail_path = os.path.join(details_dir, _detail_filename(input_file))
+    if _is_completed_output(detail_path):
+      print(f"Skipping completed file {input_file} because {detail_path} already exists.")
+      summary.append(_summary_item_from_detail_file(input_file, detail_path))
+      continue
+
+    examples, bad_rows = _load_examples(input_file, args.prompt_prefixes)
+    if bad_rows:
+      bad_rows_path = os.path.join(bad_rows_dir, _bad_rows_filename(input_file))
+      _write_jsonl(bad_rows_path, bad_rows)
+      print(
+          f"Skipped {len(bad_rows)} bad rows from {input_file}; "
+          f"details saved to {bad_rows_path}"
+      )
+    if not examples:
+      print(f"Skipping {input_file} because no valid examples remain after filtering.")
+      continue
     ds = _build_dataset(
         examples,
         tokenizer,
@@ -423,23 +501,14 @@ def main() -> None:
     predictions, _, _ = trainer.predict(test_dataset=ds)
     scores = np.asarray(predictions, dtype=float).reshape(-1)
 
-    detail_path = os.path.join(details_dir, _detail_filename(input_file))
-    with open(detail_path, "w", encoding="utf-8") as out:
-      for example, score in zip(examples, scores):
-        record = dict(example)
-        record["prediction"] = float(score)
-        out.write(json.dumps(record, ensure_ascii=False) + "\n")
+    detail_rows = []
+    for example, score in zip(examples, scores):
+      record = dict(example)
+      record["prediction"] = float(score)
+      detail_rows.append(record)
+    _write_jsonl(detail_path, detail_rows)
 
-    item = {
-        "input_file": input_file,
-        "input_dir": os.path.dirname(input_file),
-        "num_examples": len(examples),
-        "mean_score": float(np.mean(scores)),
-        "median_score": float(np.median(scores)),
-        "min_score": float(np.min(scores)),
-        "max_score": float(np.max(scores)),
-        "detail_file": detail_path,
-    }
+    item = _summary_item_from_detail_file(input_file, detail_path)
     summary.append(item)
   partial_summary_path = _partial_summary_path(
       args.output_dir, args.shard_index, args.num_shards
