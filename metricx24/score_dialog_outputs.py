@@ -101,6 +101,21 @@ class Arguments:
       metadata={"help": "Only merge shard partial summaries."},
   )
 
+  preprocessing_num_workers: int = dataclasses.field(
+      default=4,
+      metadata={"help": "Number of worker processes for dataset.map."},
+  )
+
+  dataloader_num_workers: int = dataclasses.field(
+      default=4,
+      metadata={"help": "Number of worker processes for the dataloader."},
+  )
+
+  bf16: bool = dataclasses.field(
+      default=False,
+      metadata={"help": "Load and run the model in bfloat16 on supported GPUs."},
+  )
+
 
 def _extract_source(user_content: str, prompt_prefixes: list[str]) -> str:
   """Extracts the source text from the user prompt."""
@@ -174,10 +189,11 @@ def _build_dataset(
     examples: list[dict[str, str]],
     tokenizer,
     max_input_length: int,
-    device,
     is_qe: bool,
+    preprocessing_num_workers: int,
 ):
   """Builds a tokenized dataset compatible with Trainer.predict."""
+  preprocessing_num_workers = max(1, preprocessing_num_workers)
 
   def _make_input(example):
     if is_qe:
@@ -212,13 +228,13 @@ def _build_dataset(
     return example
 
   ds = datasets.Dataset.from_list(examples)
-  ds = ds.map(_make_input)
-  ds = ds.map(_tokenize)
-  ds = ds.map(_remove_eos)
+  map_kwargs = {"num_proc": preprocessing_num_workers}
+  ds = ds.map(_make_input, **map_kwargs)
+  ds = ds.map(_tokenize, **map_kwargs)
+  ds = ds.map(_remove_eos, **map_kwargs)
   ds.set_format(
       type="torch",
       columns=["input_ids", "attention_mask"],
-      device=device,
       output_all_columns=True,
   )
   return ds
@@ -242,11 +258,18 @@ def _detail_filename(input_file: str) -> str:
 def _shard_input_files(
     input_files: list[str], shard_index: int, num_shards: int
 ) -> list[str]:
-  return [
-      input_file
-      for idx, input_file in enumerate(input_files)
-      if idx % num_shards == shard_index
-  ]
+  sorted_files = sorted(
+      input_files,
+      key=lambda input_file: os.path.getsize(input_file),
+      reverse=True,
+  )
+  shards = [[] for _ in range(num_shards)]
+  shard_sizes = [0 for _ in range(num_shards)]
+  for input_file in sorted_files:
+    target_shard = min(range(num_shards), key=lambda idx: shard_sizes[idx])
+    shards[target_shard].append(input_file)
+    shard_sizes[target_shard] += os.path.getsize(input_file)
+  return sorted(shards[shard_index])
 
 
 def _partials_dir(output_dir: str) -> str:
@@ -356,8 +379,11 @@ def main() -> None:
     per_device_batch_size = args.batch_size
 
   tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
+  model_dtype = (
+      torch.bfloat16 if args.bf16 and torch.cuda.is_available() else "auto"
+  )
   model = models.MT5ForRegression.from_pretrained(
-      args.model_name_or_path, torch_dtype="auto"
+      args.model_name_or_path, torch_dtype=model_dtype
   )
   model.to(device)
   model.eval()
@@ -365,7 +391,9 @@ def main() -> None:
   training_args = transformers.TrainingArguments(
       output_dir=args.output_dir,
       per_device_eval_batch_size=per_device_batch_size,
-      dataloader_pin_memory=False,
+      dataloader_pin_memory=torch.cuda.is_available(),
+      dataloader_num_workers=args.dataloader_num_workers,
+      bf16=args.bf16 and torch.cuda.is_available(),
   )
   trainer = transformers.Trainer(
       model=model,
@@ -389,8 +417,8 @@ def main() -> None:
         examples,
         tokenizer,
         args.max_input_length,
-        device,
         args.qe,
+        args.preprocessing_num_workers,
     )
     predictions, _, _ = trainer.predict(test_dataset=ds)
     scores = np.asarray(predictions, dtype=float).reshape(-1)
