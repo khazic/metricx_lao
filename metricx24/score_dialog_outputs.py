@@ -32,6 +32,10 @@ DEFAULT_PROMPT_PREFIXES = [
 
 @dataclasses.dataclass
 class Arguments:
+  output_dir: str = dataclasses.field(
+      metadata={"help": "Directory for summary and per-file predictions."},
+  )
+
   tokenizer: str | None = dataclasses.field(
       default=None,
       metadata={"help": "The tokenizer name."},
@@ -49,10 +53,6 @@ class Arguments:
               "One or more directories containing *_result.txt files to score."
           )
       },
-  )
-
-  output_dir: str = dataclasses.field(
-      metadata={"help": "Directory for summary and per-file predictions."},
   )
 
   max_input_length: int = dataclasses.field(
