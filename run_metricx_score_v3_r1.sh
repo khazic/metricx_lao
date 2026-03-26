@@ -4,11 +4,11 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HF_CACHE_ROOT="${HF_CACHE_ROOT:-/llm-align/liuchonghan/hf_cache}"
-MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--metricx-24-hybrid-xl-v2p6/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
+MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--metricx-24-hybrid-xxl-v2p6/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
 TOKENIZER_SNAPSHOT="${TOKENIZER_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--mt5-xl/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-/llm-align/liuchonghan/metricx_result}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 MAX_INPUT_LENGTH="${MAX_INPUT_LENGTH:-1024}"
 NUM_GPUS="${NUM_GPUS:-8}"
 PREPROCESSING_NUM_WORKERS="${PREPROCESSING_NUM_WORKERS:-8}"
@@ -18,6 +18,8 @@ USE_BF16="${USE_BF16:-1}"
 INPUT_DIR_1="${INPUT_DIR_1:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_1}"
 INPUT_DIR_2="${INPUT_DIR_2:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_2_t0.9}"
 INPUT_DIR_3="${INPUT_DIR_3:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_3_t0.9}"
+INPUT_DIR_4="${INPUT_DIR_4:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_4_t0.9}"
+INPUT_DIR_5="${INPUT_DIR_5:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_5_t0.9}"
 
 if [[ -z "$MODEL_SNAPSHOT" || ! -d "$MODEL_SNAPSHOT" ]]; then
   echo "MetricX model snapshot not found under $HF_CACHE_ROOT" >&2
@@ -48,6 +50,8 @@ echo "input_dirs:"
 echo "  $INPUT_DIR_1"
 echo "  $INPUT_DIR_2"
 echo "  $INPUT_DIR_3"
+echo "  $INPUT_DIR_4"
+echo "  $INPUT_DIR_5"
 
 EXTRA_ARGS=()
 if [[ "$USE_BF16" == "1" ]]; then
@@ -61,7 +65,7 @@ for ((SHARD_INDEX=0; SHARD_INDEX<NUM_GPUS; SHARD_INDEX++)); do
   CUDA_VISIBLE_DEVICES="$SHARD_INDEX" python3 -m metricx24.score_dialog_outputs \
     --tokenizer "$TOKENIZER_SNAPSHOT" \
     --model_name_or_path "$MODEL_SNAPSHOT" \
-    --input_dirs "$INPUT_DIR_1" "$INPUT_DIR_2" "$INPUT_DIR_3" \
+    --input_dirs "$INPUT_DIR_1" "$INPUT_DIR_2" "$INPUT_DIR_3" "$INPUT_DIR_4" "$INPUT_DIR_5" \
     --output_dir "$OUTPUT_DIR" \
     --batch_size "$BATCH_SIZE" \
     --max_input_length "$MAX_INPUT_LENGTH" \
