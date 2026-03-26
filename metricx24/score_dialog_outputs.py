@@ -32,15 +32,18 @@ DEFAULT_PROMPT_PREFIXES = [
 
 @dataclasses.dataclass
 class Arguments:
-  tokenizer: str = dataclasses.field(
+  tokenizer: str | None = dataclasses.field(
+      default=None,
       metadata={"help": "The tokenizer name."},
   )
 
-  model_name_or_path: str = dataclasses.field(
+  model_name_or_path: str | None = dataclasses.field(
+      default=None,
       metadata={"help": "MetricX model path or Hugging Face model id."},
   )
 
   input_dirs: list[str] = dataclasses.field(
+      default_factory=list,
       metadata={
           "help": (
               "One or more directories containing *_result.txt files to score."
@@ -81,6 +84,21 @@ class Arguments:
   qe: bool = dataclasses.field(
       default=True,
       metadata={"help": "Run MetricX in QE mode."},
+  )
+
+  shard_index: int = dataclasses.field(
+      default=0,
+      metadata={"help": "Current shard index, 0-based."},
+  )
+
+  num_shards: int = dataclasses.field(
+      default=1,
+      metadata={"help": "Total number of shards."},
+  )
+
+  merge_only: bool = dataclasses.field(
+      default=False,
+      metadata={"help": "Only merge shard partial summaries."},
   )
 
 
@@ -221,6 +239,89 @@ def _detail_filename(input_file: str) -> str:
   return f"{parent}__{os.path.basename(input_file)}.jsonl"
 
 
+def _shard_input_files(
+    input_files: list[str], shard_index: int, num_shards: int
+) -> list[str]:
+  return [
+      input_file
+      for idx, input_file in enumerate(input_files)
+      if idx % num_shards == shard_index
+  ]
+
+
+def _partials_dir(output_dir: str) -> str:
+  return os.path.join(output_dir, "partials")
+
+
+def _partial_summary_path(
+    output_dir: str, shard_index: int, num_shards: int
+) -> str:
+  filename = f"summary_shard_{shard_index:05d}_of_{num_shards:05d}.json"
+  return os.path.join(_partials_dir(output_dir), filename)
+
+
+def _write_json(output_file: str, payload: Any) -> None:
+  dirname = os.path.dirname(output_file)
+  if dirname:
+    os.makedirs(dirname, exist_ok=True)
+  with open(output_file, "w", encoding="utf-8") as out:
+    json.dump(payload, out, ensure_ascii=False, indent=2)
+
+
+def _summarize_by_dir(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  summary_by_dir = {}
+  for item in summary:
+    input_dir = item["input_dir"]
+    if input_dir not in summary_by_dir:
+      summary_by_dir[input_dir] = {
+          "input_dir": input_dir,
+          "num_files": 0,
+          "num_examples": 0,
+          "weighted_score_sum": 0.0,
+      }
+    summary_by_dir[input_dir]["num_files"] += 1
+    summary_by_dir[input_dir]["num_examples"] += item["num_examples"]
+    summary_by_dir[input_dir]["weighted_score_sum"] += (
+        item["mean_score"] * item["num_examples"]
+    )
+
+  summary_by_dir_items = []
+  for item in summary_by_dir.values():
+    item["mean_score"] = item["weighted_score_sum"] / item["num_examples"]
+    del item["weighted_score_sum"]
+    summary_by_dir_items.append(item)
+  return sorted(summary_by_dir_items, key=lambda item: item["input_dir"])
+
+
+def _write_final_summaries(output_dir: str, summary: list[dict[str, Any]]) -> None:
+  summary = sorted(summary, key=lambda item: item["input_file"])
+  summary_path = os.path.join(output_dir, "summary.json")
+  summary_by_dir_path = os.path.join(output_dir, "summary_by_dir.json")
+  _write_json(summary_path, summary)
+  _write_json(summary_by_dir_path, _summarize_by_dir(summary))
+  print(f"Saved summary to {summary_path}")
+  print(f"Saved directory summary to {summary_by_dir_path}")
+
+
+def _merge_partial_summaries(output_dir: str, num_shards: int) -> None:
+  merged_summary = []
+  missing = []
+  for shard_index in range(num_shards):
+    partial_path = _partial_summary_path(output_dir, shard_index, num_shards)
+    if not os.path.exists(partial_path):
+      missing.append(partial_path)
+      continue
+    with open(partial_path, "r", encoding="utf-8") as f:
+      merged_summary.extend(json.load(f))
+
+  if missing:
+    raise ValueError(
+        "Missing shard partial summaries: " + ", ".join(missing)
+    )
+
+  _write_final_summaries(output_dir, merged_summary)
+
+
 def main() -> None:
   parser = transformers.HfArgumentParser(Arguments)
   (args,) = parser.parse_args_into_dataclasses()
@@ -229,9 +330,27 @@ def main() -> None:
   details_dir = os.path.join(args.output_dir, "details")
   os.makedirs(details_dir, exist_ok=True)
 
+  if args.num_shards < 1:
+    raise ValueError("--num_shards must be at least 1.")
+  if args.shard_index < 0 or args.shard_index >= args.num_shards:
+    raise ValueError("--shard_index must be in [0, num_shards).")
+
+  if args.merge_only:
+    _merge_partial_summaries(args.output_dir, args.num_shards)
+    return
+
+  if not args.tokenizer:
+    raise ValueError("--tokenizer is required unless --merge_only is set.")
+  if not args.model_name_or_path:
+    raise ValueError(
+        "--model_name_or_path is required unless --merge_only is set."
+    )
+  if not args.input_dirs:
+    raise ValueError("--input_dirs is required unless --merge_only is set.")
+
   if torch.cuda.is_available():
     device = torch.device("cuda")
-    per_device_batch_size = max(1, args.batch_size // torch.cuda.device_count())
+    per_device_batch_size = args.batch_size
   else:
     device = torch.device("cpu")
     per_device_batch_size = args.batch_size
@@ -255,10 +374,14 @@ def main() -> None:
   )
 
   summary = []
-  summary_by_dir = {}
   input_files = _get_input_files(args.input_dirs, args.file_pattern)
   if not input_files:
     raise ValueError("No input files matched the given directories and file pattern.")
+  input_files = _shard_input_files(input_files, args.shard_index, args.num_shards)
+  print(
+      f"Shard {args.shard_index}/{args.num_shards} processing "
+      f"{len(input_files)} files."
+  )
 
   for input_file in input_files:
     examples = _load_examples(input_file, args.prompt_prefixes)
@@ -290,33 +413,10 @@ def main() -> None:
         "detail_file": detail_path,
     }
     summary.append(item)
-
-    input_dir = item["input_dir"]
-    if input_dir not in summary_by_dir:
-      summary_by_dir[input_dir] = {
-          "input_dir": input_dir,
-          "num_files": 0,
-          "num_examples": 0,
-          "weighted_score_sum": 0.0,
-      }
-    summary_by_dir[input_dir]["num_files"] += 1
-    summary_by_dir[input_dir]["num_examples"] += item["num_examples"]
-    summary_by_dir[input_dir]["weighted_score_sum"] += (
-        item["mean_score"] * item["num_examples"]
-    )
-
-  summary_path = os.path.join(args.output_dir, "summary.json")
-  with open(summary_path, "w", encoding="utf-8") as out:
-    json.dump(summary, out, ensure_ascii=False, indent=2)
-
-  summary_by_dir_path = os.path.join(args.output_dir, "summary_by_dir.json")
-  summary_by_dir_items = []
-  for item in summary_by_dir.values():
-    item["mean_score"] = item["weighted_score_sum"] / item["num_examples"]
-    del item["weighted_score_sum"]
-    summary_by_dir_items.append(item)
-  with open(summary_by_dir_path, "w", encoding="utf-8") as out:
-    json.dump(summary_by_dir_items, out, ensure_ascii=False, indent=2)
+  partial_summary_path = _partial_summary_path(
+      args.output_dir, args.shard_index, args.num_shards
+  )
+  _write_json(partial_summary_path, summary)
 
   for item in summary:
     print(
@@ -329,8 +429,10 @@ def main() -> None:
             ensure_ascii=False,
         )
     )
-  print(f"Saved summary to {summary_path}")
-  print(f"Saved directory summary to {summary_by_dir_path}")
+  print(f"Saved shard summary to {partial_summary_path}")
+
+  if args.num_shards == 1:
+    _write_final_summaries(args.output_dir, summary)
 
 
 if __name__ == "__main__":

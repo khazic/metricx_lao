@@ -7,9 +7,10 @@ HF_CACHE_ROOT="${HF_CACHE_ROOT:-/llm-align/liuchonghan/hf_cache}"
 MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--metricx-24-hybrid-xl-v2p6/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
 TOKENIZER_SNAPSHOT="${TOKENIZER_SNAPSHOT:-$(find "$HF_CACHE_ROOT/models--google--mt5-xl/snapshots" -mindepth 1 -maxdepth 1 -type d | head -n 1)}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-/llm-align/liuchonghan/metricx_scores_v3_r1}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
-MAX_INPUT_LENGTH="${MAX_INPUT_LENGTH:-1536}"
+OUTPUT_DIR="${OUTPUT_DIR:-/llm-align/liuchonghan/metricx_result}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
+MAX_INPUT_LENGTH="${MAX_INPUT_LENGTH:-1024}"
+NUM_GPUS="${NUM_GPUS:-8}"
 
 INPUT_DIR_1="${INPUT_DIR_1:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_1}"
 INPUT_DIR_2="${INPUT_DIR_2:-/llm-align/duyimin/multi_lang/v3_r1/result_top_lang_train_data_sample_2_t0.9}"
@@ -26,6 +27,7 @@ if [[ -z "$TOKENIZER_SNAPSHOT" || ! -d "$TOKENIZER_SNAPSHOT" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR/logs"
 
 cd "$REPO_DIR"
 
@@ -35,17 +37,36 @@ echo "tokenizer_snapshot=$TOKENIZER_SNAPSHOT"
 echo "output_dir=$OUTPUT_DIR"
 echo "batch_size=$BATCH_SIZE"
 echo "max_input_length=$MAX_INPUT_LENGTH"
+echo "num_gpus=$NUM_GPUS"
 echo "input_dirs:"
 echo "  $INPUT_DIR_1"
 echo "  $INPUT_DIR_2"
 echo "  $INPUT_DIR_3"
 
+PIDS=()
+for ((SHARD_INDEX=0; SHARD_INDEX<NUM_GPUS; SHARD_INDEX++)); do
+  LOG_FILE="$OUTPUT_DIR/logs/shard_${SHARD_INDEX}.log"
+  echo "starting shard=$SHARD_INDEX log_file=$LOG_FILE"
+  CUDA_VISIBLE_DEVICES="$SHARD_INDEX" python3 -m metricx24.score_dialog_outputs \
+    --tokenizer "$TOKENIZER_SNAPSHOT" \
+    --model_name_or_path "$MODEL_SNAPSHOT" \
+    --input_dirs "$INPUT_DIR_1" "$INPUT_DIR_2" "$INPUT_DIR_3" \
+    --output_dir "$OUTPUT_DIR" \
+    --batch_size "$BATCH_SIZE" \
+    --max_input_length "$MAX_INPUT_LENGTH" \
+    --num_shards "$NUM_GPUS" \
+    --shard_index "$SHARD_INDEX" \
+    --qe > "$LOG_FILE" 2>&1 &
+  PIDS+=("$!")
+done
+
+for PID in "${PIDS[@]}"; do
+  wait "$PID"
+done
+
 python3 -m metricx24.score_dialog_outputs \
-  --tokenizer "$TOKENIZER_SNAPSHOT" \
-  --model_name_or_path "$MODEL_SNAPSHOT" \
-  --input_dirs "$INPUT_DIR_1" "$INPUT_DIR_2" "$INPUT_DIR_3" \
   --output_dir "$OUTPUT_DIR" \
-  --batch_size "$BATCH_SIZE" \
-  --max_input_length "$MAX_INPUT_LENGTH" \
-  --qe
+  --num_shards "$NUM_GPUS" \
+  --merge_only
+
 echo "summary_file=$OUTPUT_DIR/summary_by_dir.json"
