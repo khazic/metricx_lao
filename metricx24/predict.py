@@ -154,7 +154,7 @@ def main() -> None:
   )
 
   training_args = transformers.TrainingArguments(
-      output_dir=os.path.dirname(args.output_file),
+      output_dir=os.path.dirname(args.output_file) or ".",
       per_device_eval_batch_size=per_device_batch_size,
       dataloader_pin_memory=False,
   )
@@ -168,13 +168,13 @@ def main() -> None:
   if dirname:
     os.makedirs(dirname, exist_ok=True)
 
-  with open(args.output_file, "w") as out:
+  with open(args.output_file, "w", encoding="utf-8") as out:
     for pred, example in zip(predictions, ds["test"]):
       example["prediction"] = float(pred)
       del example["input"]
       del example["input_ids"]
       del example["attention_mask"]
-      out.write(json.dumps(example) + "\n")
+      out.write(json.dumps(example, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
