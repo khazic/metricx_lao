@@ -14,6 +14,7 @@ The script converts each line into MetricX QE input with:
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 from typing import Any
@@ -257,14 +258,25 @@ def _get_input_files(input_dirs: list[str], file_pattern: str) -> list[str]:
   return input_files
 
 
+def _output_stem(input_file: str) -> str:
+  """Builds a readable output stem that is unique per input path.
+
+  The parent directory name keeps the stem readable; the hash of the absolute
+  path keeps inputs with the same parent and file name (e.g. `/a/run/x.txt`
+  and `/b/run/x.txt`) from mapping to the same output file.
+  """
+  abs_path = os.path.abspath(input_file)
+  digest = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
+  parent = os.path.basename(os.path.dirname(abs_path))
+  return f"{parent}__{os.path.basename(abs_path)}.{digest}"
+
+
 def _detail_filename(input_file: str) -> str:
-  parent = os.path.basename(os.path.dirname(input_file))
-  return f"{parent}__{os.path.basename(input_file)}.jsonl"
+  return f"{_output_stem(input_file)}.jsonl"
 
 
 def _bad_rows_filename(input_file: str) -> str:
-  parent = os.path.basename(os.path.dirname(input_file))
-  return f"{parent}__{os.path.basename(input_file)}.bad_rows.jsonl"
+  return f"{_output_stem(input_file)}.bad_rows.jsonl"
 
 
 def _tmp_path(output_file: str) -> str:
